@@ -2,11 +2,11 @@
 
 将 HarmonyOS 4 适配到 AEmulator 0.0.0.3，已完成全新导入验收。仓库包含适配过程中编写的部分源码和构建脚本；ROM 包通过 Release 提供。
 
-[下载包](../../releases/latest) · [修改日志](CHANGELOG.md) · [来源说明](NOTICE.md)
+[下载包](https://github.com/poohpiggy/AE0.0.0.3-HarmonyOS4-Repair/releases/latest) · [修改日志](CHANGELOG.md) · [来源说明](NOTICE.md)
 
 ## 下载使用
 
-1. 在 [Release](../../releases/latest) 下载两个分卷、`parts.json` 和 `join_release.py`，放入同一个文件夹。
+1. 在 [Release](https://github.com/poohpiggy/AE0.0.0.3-HarmonyOS4-Repair/releases/latest) 下载两个分卷、`parts.json` 和 `join_release.py`，放入同一个文件夹。
 2. 运行 `python join_release.py`，合并成 `AE-HarmonyOS4.zip`，然后导入 AEmulator。
 3. 在 AE 实例设置中调整为 **720×1440 / 320 DPI**。首次启动需等待系统完成初始化。
 
