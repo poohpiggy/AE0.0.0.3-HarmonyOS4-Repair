@@ -1,0 +1,5 @@
+<permissions>
+    <privapp-permissions package="org.codex.smsinit">
+        <permission name="huawei.permmisons.mms.CHANGE_MMS_RINGTON_REQUEST" />
+    </privapp-permissions>
+</permissions>

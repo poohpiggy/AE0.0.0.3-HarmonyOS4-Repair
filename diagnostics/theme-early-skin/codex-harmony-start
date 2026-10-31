@@ -1,0 +1,57 @@
+#!/system/bin/sh
+# Instance-local Harmony services. Started by AE in its own SELinux domain.
+# AE may launch a nested shell with a vendor-only PATH. System commands and
+# their shell wrappers need /system/bin before any vendor entries.
+export PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:$PATH
+
+# Prepare the existing first-boot theme path before the launcher can cache
+# icons. If user data is not ready, the original later initializer retries.
+early_root=${CODEX_FS_ROOT:-}
+early_state="$early_root/data/system/codex-harmony"
+early_skin="$early_root/data/skin"
+early_marker="$early_state/skin-initialized"
+if [ -d "$early_root/data/system" ] && [ ! -L "$early_state" ] && mkdir -p "$early_state"; then
+    if [ ! -e "$early_marker" ] && [ ! -L "$early_marker" ]; then
+        if [ -e "$early_skin" ] || [ -L "$early_skin" ]; then
+            (set -C; : > "$early_marker") 2>/dev/null || :
+        elif ln -s themes/0 "$early_skin" 2>/dev/null; then
+            (set -C; : > "$early_marker") 2>/dev/null || :
+        fi
+    fi
+fi
+
+LOG=/data/local/tmp/codex-harmony-start.log
+echo "Harmony startup waiting for Android" >> "$LOG"
+while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done
+
+if [ "$(getprop init.svc.samgr)" != running ]; then setprop ctl.start samgr; fi
+if [ "$(getprop init.svc.bundle_daemon)" != running ]; then setprop ctl.start bundle_daemon; fi
+sleep 3
+if [ "$(getprop init.svc.codex_distributeddata)" != running ]; then setprop ctl.start codex_distributeddata; fi
+sleep 3
+# These may have started before samgr during AE boot; reconnect them once.
+setprop ctl.start accountmgr
+setprop ctl.start distributedsched
+echo "Harmony core services requested" >> "$LOG"
+
+setup_pid=
+while true; do
+    # A stuck PackageManager must not block the Harmony watchdog, and no
+    # more than one setup worker may exist at once.
+    if [ -n "$setup_pid" ] && ! kill -0 "$setup_pid" 2>/dev/null; then
+        wait "$setup_pid" 2>/dev/null || :
+        setup_pid=
+    fi
+    if [ -z "$setup_pid" ] && [ -f /system/etc/codex-harmony-firstboot ]; then
+        sh /system/etc/codex-harmony-firstboot >> "$LOG" 2>&1 &
+        setup_pid=$!
+    fi
+    if [ "$(getprop init.svc.samgr)" != running ]; then setprop ctl.start samgr; fi
+    if [ "$(getprop init.svc.bundle_daemon)" != running ]; then setprop ctl.start bundle_daemon; fi
+    if [ "$(getprop init.svc.codex_distributeddata)" != running ]; then setprop ctl.start codex_distributeddata; fi
+    if [ "$(getprop init.svc.accountmgr)" != running ]; then setprop ctl.start accountmgr; fi
+    if [ "$(getprop init.svc.distributedsched)" != running ]; then setprop ctl.start distributedsched; fi
+    cmd deviceidle whitelist +org.codex.harmonybridge >> "$LOG" 2>&1
+    am startservice -n org.codex.harmonybridge/.ProbeService >> "$LOG" 2>&1
+    if [ "$(getprop sys.samgr.coresa.initready)" = 1 ]; then sleep 60; else sleep 15; fi
+done

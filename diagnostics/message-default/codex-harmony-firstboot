@@ -1,0 +1,136 @@
+#!/system/bin/sh
+# Run after Android boot; safe to retry. CODEX_FS_ROOT exists for host tests.
+# Never distribute a target device's /data or wallpaper in the repair package.
+# AE can reset PATH when starting a nested guest shell.
+export PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:$PATH
+root=${CODEX_FS_ROOT:-}
+skin="$root/data/skin"
+preview_dir="$root/data/themes/0/wallpaper"
+preview="$preview_dir/home_wallpaper_0.jpg"
+wallpaper="$root/data/system/users/0/wallpaper"
+apk="$root/system/etc/codex/harmonybridge.apk"
+
+# Store only our own completion markers. Never follow a substituted symlink.
+state_dir="$root/data/system/codex-harmony"
+[ ! -L "$state_dir" ] || exit 0
+mkdir -p "$state_dir" || exit 0
+mark() { (set -C; : > "$state_dir/$1") 2>/dev/null || :; }
+pending() { [ ! -e "$state_dir/$1" ] && [ ! -L "$state_dir/$1" ]; }
+
+# Existing entries are treated as already configured and never overwritten.
+if pending skin-initialized; then
+    if [ -e "$skin" ] || [ -L "$skin" ]; then
+        mark skin-initialized
+    elif [ -d "$root/data" ] && ln -s themes/0 "$skin" 2>/dev/null; then
+        mark skin-initialized
+    fi
+fi
+
+# Leave directory ownership to Themes; atomic same-directory link prevents
+# clobbering a concurrent or existing user preview.
+if pending preview-initialized; then
+    if [ -e "$preview" ] || [ -L "$preview" ]; then
+        mark preview-initialized
+    elif [ -s "$wallpaper" ] && [ -d "$preview_dir" ]; then
+        temp=$(mktemp "$preview_dir/.codex-preview.XXXXXX") || temp=
+        if [ -n "$temp" ]; then
+            if cat "$wallpaper" > "$temp" && chmod 0644 "$temp" && ln "$temp" "$preview" 2>/dev/null; then
+                mark preview-initialized
+            fi
+            rm -f "$temp"
+        fi
+    fi
+fi
+
+# Respect existing values; after first successful setup do not reapply.
+if pending theme-debug-initialized; then
+    if [ -n "$(getprop persist.sys.theme_debug)" ]; then
+        mark theme-debug-initialized
+    elif setprop persist.sys.theme_debug true; then
+        mark theme-debug-initialized
+    fi
+fi
+
+# Distinguish an unavailable PackageManager from an absent package. Never
+# reinstall an already present package or clear/replace its application data.
+android_path=$(pm path android 2>/dev/null) || android_path=
+case "$android_path" in
+    package:*) ;;
+    *) exit 0 ;;
+esac
+bridge_marker="$state_dir/bridge-initialized"
+if [ ! -e "$bridge_marker" ] && [ ! -L "$bridge_marker" ] && [ ! -L "$state_dir" ]; then
+    if packages=$(pm list packages 2>/dev/null); then
+        installed=no
+        for entry in $packages; do
+            [ "$entry" = 'package:org.codex.harmonybridge' ] && installed=yes
+        done
+        if [ "$installed" = no ] && [ -f "$apk" ]; then
+            if pm install "$apk"; then
+                bridge_path=$(pm path org.codex.harmonybridge 2>/dev/null) || bridge_path=
+                case "$bridge_path" in package:*) installed=yes ;; esac
+            fi
+        fi
+        if [ "$installed" = yes ] && mkdir -p "$state_dir"; then
+            (set -C; : > "$bridge_marker") 2>/dev/null || :
+        fi
+    fi
+fi
+
+# The two optional user-state changes run at most once. Record the attempt
+# before calling pm so a failed attempt cannot later override user choices.
+# A failed attempt remains visible in the log and needs deliberate review.
+theme_path=$(pm path com.huawei.android.thememanager 2>/dev/null) || theme_path=
+case "$theme_path" in package:*) theme_available=yes ;; *) theme_available=no ;; esac
+if [ "$theme_available" = yes ] && [ -f "$root/system/etc/codex/allow-theme-storage" ] && pending theme-storage-attempted; then
+    if (set -C; : > "$state_dir/theme-storage-attempted") 2>/dev/null; then
+        if pm grant com.huawei.android.thememanager android.permission.WRITE_EXTERNAL_STORAGE; then
+            mark theme-storage-granted
+        else
+            printf '%s\n' 'Theme storage permission grant failed; manual review required'
+        fi
+    fi
+fi
+
+# Fresh-import opt-in: this workaround suppresses theme previews.
+if [ "$theme_available" = yes ] && [ -f "$root/system/etc/codex/disable-theme-preview" ] && pending theme-preview-attempted; then
+    if (set -C; : > "$state_dir/theme-preview-attempted") 2>/dev/null; then
+        if disable_result=$(pm disable --user 0 'com.huawei.android.thememanager/com.huawei.android.thememanager.SettingsPreviewContentProvider' 2>&1); then
+            case "$disable_result" in
+                *'new state: disabled') mark theme-preview-disabled ;;
+                *) printf '%s\n' "Theme preview disable not confirmed: $disable_result" ;;
+            esac
+        else
+            printf '%s\n' "Theme preview disable failed: $disable_result"
+        fi
+    fi
+fi
+
+
+
+# A separate opt-in initializes the fresh instance's language once.
+if [ -f "$root/system/etc/codex-locale-firstboot" ]; then
+    sh "$root/system/etc/codex-locale-firstboot"
+fi
+
+# Optional fresh-ROM privacy default; helper preserves user/policy choices.
+if [ -f "$root/system/etc/codex-via-location-default" ]; then
+    sh "$root/system/etc/codex-via-location-default"
+fi
+
+# Protect only the two explicitly opted-in bundled system applications.
+# This helper performs package-manager readiness checks and readback itself.
+if [ -f "$root/system/etc/codex-protect-preinstalled" ]; then
+    sh "$root/system/etc/codex-protect-preinstalled"
+fi
+
+# Optional clean-import IME setup lives separately so it can be reviewed and
+# omitted independently from the Harmony service compatibility setup.
+if [ -f "$root/system/etc/codex-ime-firstboot" ]; then
+    sh "$root/system/etc/codex-ime-firstboot"
+fi
+
+# Optional clean-import SMS sound default, respecting any existing selection.
+if [ -f "$root/system/etc/codex-message-firstboot" ]; then
+    sh "$root/system/etc/codex-message-firstboot"
+fi

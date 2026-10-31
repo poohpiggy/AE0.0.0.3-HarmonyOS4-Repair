@@ -1,0 +1,360 @@
+#!/system/bin/sh
+# Fresh-import only: observe a missing SMS default, then ask the original MMS
+# service to initialize Bongo. Never modify existing user choices or themes.
+export PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:$PATH
+root=${CODEX_FS_ROOT:-}
+opt="$root/system/etc/codex/enable-message-default"
+probe="$root/system/etc/codex/codex-sms-channel-status.jar"
+state="$root/data/system/codex-harmony"
+window="$state/sms-original-init-window"
+evidence="$state/sms-original-init-evidence"
+attempt="$state/sms-original-init-attempted"
+success="$state/sms-original-init-success"
+prefs="$root/data/user/0/com.android.mms/shared_prefs/com.android.mms_preferences.xml"
+result="$root/data/user/0/org.codex.smsinit/files/result"
+sound=/system/media/audio/notifications/Bongo.ogg
+cfg_uri=content://com.huawei.systemmanager.NotificationDBProvider/notificationCfg
+cfg_where="packageName='com.android.mms' AND channelid='mms_sim1_channel'"
+
+[ -f "$opt" ] && [ ! -L "$opt" ] && [ -f "$probe" ] && [ ! -L "$probe" ] || exit 0
+[ ! -L "$state" ] || exit 0
+mkdir -p "$state" || exit 0
+tracefile="$state/sms-original-init-stages"
+trace() { [ ! -L "$tracefile" ] || return 0; printf '%s\n' "$1" >> "$tracefile" 2>/dev/null || :; }
+[ ! -e "$attempt" ] && [ ! -L "$attempt" ] || exit 0
+trace ENTER
+[ ! -L "$window" ] || exit 0
+now=$(date +%s 2>/dev/null) || exit 0
+case "$now" in ''|*[!0-9]*) exit 0 ;; esac
+if [ ! -e "$window" ]; then (set -C; printf '%s\n' "$now" > "$window") 2>/dev/null || exit 0; fi
+IFS= read -r started < "$window" || exit 0
+case "$started" in ''|*[!0-9]*) exit 0 ;; esac
+window_open() {
+    current=$(date +%s 2>/dev/null) || return 1
+    case "$current" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$current" -ge "$started" ] && [ "$((current-started))" -le 300 ]
+}
+finish_attempt() { (set -C; : > "$attempt") 2>/dev/null || :; }
+
+# A literal null can also represent the user's silent choice. We therefore
+# additionally require no MMS follow-choice key, an unlocked empty channel,
+# and a pre-scan observation. A very early silent choice can still race us.
+settings_unused() {
+    listing=$(timeout 5 settings list system 2>/dev/null) || return 2
+    [ -n "$listing" ] || return 2
+    while IFS= read -r line; do
+        case "$line" in message_path=*) return 1 ;; message=null) ;; message=*) return 1 ;; esac
+    done <<EOF
+$listing
+EOF
+    return 0
+}
+prefs_unused() {
+    [ -f "$prefs" ] && [ ! -L "$prefs" ] || return 1
+    grep -q 'pref_mms_is_follow_notification' "$prefs" 2>/dev/null
+    found=$?
+    [ "$found" = 1 ]
+}
+channel_status() { CLASSPATH="$probe" timeout 5 app_process /system/bin SmsChannelStatus "$@" 2>/dev/null; }
+huawei_status() { timeout 5 content query --uri "$cfg_uri" --projection sound_vibrate --where "$cfg_where" 2>/dev/null; }
+# Be conservative: refuse to stop MMS if it appears in any activity task,
+# or if the activity manager cannot identify a visible activity.
+mms_safe_to_stop() {
+    tasks=$(timeout 5 cmd activity stack list 2>/dev/null) || return 1
+    visible=0
+    while IFS= read -r task; do
+        case "$task" in
+            *com.android.mms*) return 1 ;;
+            *visible=true*"topActivity=ComponentInfo{"*) visible=1 ;;
+        esac
+    done <<EOF
+$tasks
+EOF
+    [ "$visible" = 1 ]
+}
+
+# Derive the installed MMS UID, and refuse to touch an already stopped app.
+mms_identify() {
+    info=$(timeout 5 cmd package dump com.android.mms 2>/dev/null) || return 1
+    mms_uid=; unstopped=0
+    while IFS= read -r line; do
+        case "$line" in
+            '    userId='*)
+                candidate=${line#'    userId='}
+                case "$candidate" in ''|*[!0-9]*) return 1 ;; esac
+                [ -z "$mms_uid" ] || return 1
+                mms_uid=$candidate ;;
+            *'User 0:'*'stopped=false'*) unstopped=1 ;;
+        esac
+    done <<EOF
+$info
+EOF
+    [ -n "$mms_uid" ] && [ "$unstopped" = 1 ]
+}
+mms_process_dead() {
+    process_state=$(timeout 5 cmd activity get-uid-state "$mms_uid" 2>/dev/null) || return 1
+    [ "$process_state" = '20 (NONEXISTENT)' ]
+}
+
+# If the system established our requested Bongo after we observed an untouched
+# first boot, make the missing slot-0 preference agree with the active global
+# choice. No ringtone or channel setting is changed in this branch.
+reconcile_defaults() (
+    [ -f "$evidence" ] && [ ! -L "$evidence" ] || exit 1
+    window_open || exit 1
+    found=$(timeout 5 content query --uri content://media/internal/audio/media --projection _id --where "_data='$sound'" 2>/dev/null) || exit 1
+    case "$found" in 'Row: 0 _id='*) id=${found#Row: 0 _id=} ;; *) exit 1 ;; esac
+    case "$id" in ''|*[!0-9]*) exit 1 ;; esac
+    uri="content://media/internal/audio/media/$id"
+    sample=$(mktemp "$root/data/local/tmp/codex-reconcile-audio.XXXXXX") || exit 1
+    if ! timeout 5 content read --uri "$uri" > "$sample" 2>/dev/null || ! cmp -s "$sample" "$root$sound"; then
+        rm -f "$sample"; exit 1
+    fi
+    rm -f "$sample"
+    single_phone() {
+        state_dump=$(timeout 5 dumpsys telephony.registry 2>/dev/null) || return 1
+        count=0
+        while IFS= read -r line; do
+            case "$line" in
+                '  Phone Id=0') count=$((count+1)) ;;
+                '  Phone Id='*) return 1 ;;
+            esac
+        done <<END_DUMP
+$state_dump
+END_DUMP
+        [ "$count" = 1 ]
+    }
+    reconcile_prefs_ok() {
+        [ -f "$prefs" ] && [ ! -L "$prefs" ] || return 1
+        n=$(grep -c 'pref_mms_is_follow_notification' "$prefs" 2>/dev/null) || return 1
+        [ "$n" = 1 ] || return 1
+        grep -q '^[[:space:]]*<boolean name="pref_mms_is_follow_notification" value="false"[[:space:]]*/>[[:space:]]*$' "$prefs" 2>/dev/null || return 1
+        grep -q 'pref_mms_is_follow_notification_sub' "$prefs" 2>/dev/null
+        found_key=$?
+        [ "$found_key" = 1 ]
+    }
+    reconcile_choice_ok() {
+        [ "$(timeout 5 settings get system message 2>/dev/null)" = "$uri" ] || return 1
+        [ "$(timeout 5 settings get system message_path 2>/dev/null)" = "$sound" ] || return 1
+        reconcile_prefs_ok
+    }
+    reconcile_services_ready() {
+        [ "$(huawei_status)" = 'Row: 0 sound_vibrate=3' ] || return 1
+        [ "$(channel_status "$uri")" = MATCH ] || return 1
+        single_phone
+    }
+    reconcile_state_ok() {
+        reconcile_choice_ok && reconcile_services_ready && window_open
+    }
+    reconcile_activity_safe() {
+        mms_safe_to_stop || return 1
+        current_tasks=$(timeout 5 cmd activity stack list 2>/dev/null) || return 1
+        home_visible=0
+        while IFS= read -r line; do
+            case "$line" in
+                *visible=true*'topActivity=ComponentInfo{com.huawei.android.launcher/'*) home_visible=1 ;;
+                *visible=true*'topActivity=ComponentInfo{'*) return 1 ;;
+            esac
+        done <<END_TASKS
+$current_tasks
+END_TASKS
+        [ "$home_visible" = 1 ]
+    }
+    reconcile_choice_ok || exit 1
+    reconcile_services_ready || exit 2
+    reconcile_activity_safe || exit 2
+    mms_identify || exit 2
+    backup=; updated=; mms_kill_issued=0
+    cleanup_reconcile() {
+        rm -f "$backup" "$updated" 2>/dev/null
+        if [ "$mms_kill_issued" = 1 ]; then
+            timeout 5 cmd deviceidle tempwhitelist -u 0 -d 20000 com.android.mms >/dev/null 2>&1 || :
+            timeout 5 am startservice --user 0 -n com.android.mms/com.huawei.mms.service.MessageRingtonService >/dev/null 2>&1 || :
+        fi
+    }
+    trap cleanup_reconcile EXIT
+    trap 'exit 1' HUP INT TERM
+    reconcile_activity_safe || exit 1
+    mms_kill_issued=1
+    timeout 5 am kill --user 0 com.android.mms >/dev/null 2>&1 || exit 1
+    polls=0
+    while ! mms_process_dead; do
+        reconcile_activity_safe && reconcile_state_ok || exit 1
+        polls=$((polls+1)); [ "$polls" -lt 5 ] || exit 1
+        sleep 1 || exit 1
+    done
+    reconcile_activity_safe && reconcile_state_ok || exit 1
+    [ "$(grep -c '^</map>$' "$prefs" 2>/dev/null)" = 1 ] || exit 1
+    [ "$(grep -c '^<map>$' "$prefs" 2>/dev/null)" = 1 ] || exit 1
+    backup=$(mktemp "$prefs.codex-base.XXXXXX") || exit 1
+    updated=$(mktemp "$prefs.codex-new.XXXXXX") || exit 1
+    cp -p "$prefs" "$backup" && cp -p "$prefs" "$updated" || exit 1
+    while IFS= read -r prefline; do
+        if [ "$prefline" = '</map>' ]; then
+            printf '%s\n' '    <boolean name="pref_mms_is_follow_notification_sub0" value="false" />'
+        fi
+        printf '%s\n' "$prefline"
+    done < "$backup" > "$updated" || exit 1
+    set -- $(ls -Zd "$prefs" 2>/dev/null); original_label=$1
+    set -- $(ls -Zd "$updated" 2>/dev/null); updated_label=$1
+    [ -n "$original_label" ] && [ "$original_label" = "$updated_label" ] || exit 1
+    original_meta=$(stat -c '%u:%g:%a' "$prefs" 2>/dev/null) || exit 1
+    updated_meta=$(stat -c '%u:%g:%a' "$updated" 2>/dev/null) || exit 1
+    [ -n "$original_meta" ] && [ "$original_meta" = "$updated_meta" ] || exit 1
+    cmp -s "$prefs" "$backup" || exit 1
+    reconcile_activity_safe && reconcile_state_ok && mms_process_dead || exit 1
+    cmp -s "$prefs" "$backup" || exit 1
+    mv -f "$updated" "$prefs" || exit 1
+    grep -q '^[[:space:]]*<boolean name="pref_mms_is_follow_notification_sub0" value="false"[[:space:]]*/>[[:space:]]*$' "$prefs" 2>/dev/null || exit 1
+    (set -C; : > "$state/sms-follow-reconciled") 2>/dev/null || :
+    exit 0
+)
+
+while :; do
+    if ! window_open; then trace WINDOW_EXPIRED; finish_attempt; exit 0; fi
+    settings_unused; settings_state=$?
+    if [ "$settings_state" = 1 ]; then
+        if [ -f "$evidence" ] && [ ! -L "$evidence" ]; then
+            reconcile_defaults; reconciliation=$?
+            case "$reconciliation" in
+                0) trace FOLLOW_RECONCILED; finish_attempt; exit 0 ;;
+                2) trace FOLLOW_WAIT_READY; sleep 3 || exit 0; continue ;;
+            esac
+        fi
+        trace EXISTING_SETTINGS; finish_attempt; exit 0
+    fi
+    if [ "$settings_state" != 0 ]; then sleep 3 || exit 0; continue; fi
+    if [ ! -f "$prefs" ] || [ -L "$prefs" ]; then sleep 3 || exit 0; continue; fi
+    if ! prefs_unused; then trace EXISTING_PREFERENCE; finish_attempt; exit 0; fi
+
+    if [ ! -e "$evidence" ] && [ ! -L "$evidence" ]; then
+        notification=$(timeout 5 settings get system notification_sound 2>/dev/null) || notification=unavailable
+        cfg=$(huawei_status) || cfg=unavailable
+        channel=$(channel_status) || channel=unavailable
+        if [ "$notification" = null ] && [ "$cfg" = 'Row: 0 sound_vibrate=2' ] && [ "$channel" = EMPTY_UNLOCKED ]; then
+            (set -C; : > "$evidence") 2>/dev/null || :; trace EVIDENCE_CAPTURED
+        fi
+    fi
+    [ -f "$evidence" ] && [ ! -L "$evidence" ] || { sleep 3 || exit 0; continue; }
+
+    found=$(timeout 5 content query --uri content://media/internal/audio/media --projection _id --where "_data='$sound'" 2>/dev/null) || found=
+    case "$found" in 'Row: 0 _id='*) id=${found#Row: 0 _id=} ;; *) id= ;; esac
+    case "$id" in ''|*[!0-9]*) sleep 3 || exit 0; continue ;; esac
+    trace MEDIA_FOUND
+    uri="content://media/internal/audio/media/$id"
+    tmp=$(mktemp "$root/data/local/tmp/codex-sms-audio.XXXXXX") || exit 0
+    if ! timeout 5 content read --uri "$uri" > "$tmp" 2>/dev/null || ! cmp -s "$tmp" "$root$sound"; then
+        rm -f "$tmp"; sleep 3 || exit 0; continue
+    fi
+    rm -f "$tmp"
+    settings_unused; settings_state=$?
+    if [ "$settings_state" = 1 ] || ! prefs_unused; then trace PRECOMMIT_USER_STATE_CHANGED; finish_attempt; exit 0; fi
+    [ "$settings_state" = 0 ] || { sleep 3 || exit 0; continue; }
+    [ "$(huawei_status)" = 'Row: 0 sound_vibrate=2' ] || { trace PRECOMMIT_SOUND_CHANGED; finish_attempt; exit 0; }
+    [ "$(channel_status)" = EMPTY_UNLOCKED ] || { trace PRECOMMIT_CHANNEL_CHANGED; finish_attempt; exit 0; }
+    [ "$(timeout 5 pm path org.codex.smsinit 2>/dev/null)" = 'package:/system/priv-app/CodexSmsInit/CodexSmsInit.apk' ] || { sleep 3 || exit 0; continue; }
+    window_open || { trace PRECOMMIT_WINDOW_EXPIRED; finish_attempt; exit 0; }
+    mms_safe_to_stop || { trace WAIT_ACTIVITY; sleep 3 || exit 0; continue; }
+    mms_identify || { trace WAIT_MMS_IDENTITY; sleep 3 || exit 0; continue; }
+    nonce=$(date +%s 2>/dev/null) || exit 0
+    case "$nonce" in ''|*[!0-9]*) exit 0 ;; esac
+    (set -C; : > "$attempt") 2>/dev/null || exit 0
+    trace ATTEMPT_MARKED
+    # Killing only a background process never marks the package stopped;
+    # if AMS keeps it alive, do not edit its cached SharedPreferences.
+    backup=; updated=; mms_kill_issued=0
+    cleanup_after_kill() {
+        rm -f "$backup" "$updated" 2>/dev/null
+        if [ "$mms_kill_issued" = 1 ]; then
+            trace CLEANUP_RESTART_REQUESTED
+            timeout 5 cmd deviceidle tempwhitelist -u 0 -d 20000 com.android.mms >/dev/null 2>&1 || :
+            timeout 5 am startservice --user 0 -n com.android.mms/com.huawei.mms.service.MessageRingtonService >/dev/null 2>&1 || :
+        fi
+    }
+    trap cleanup_after_kill EXIT
+    trap 'exit 1' HUP INT TERM
+    mms_safe_to_stop || { trace ACTIVITY_CHANGED; exit 0; }
+    trace BEFORE_KILL
+    mms_kill_issued=1
+    timeout 5 am kill --user 0 com.android.mms >/dev/null 2>&1 || { trace KILL_FAILED; exit 0; }
+    trace KILL_RETURNED
+    # AMS kills the background process asynchronously. Poll it a small number
+    # of times, but abort promptly if any user or notification state changes.
+    polls=0
+    while ! mms_process_dead; do
+        if ! window_open || ! mms_safe_to_stop || ! settings_unused || ! prefs_unused; then
+            trace WAIT_ABORTED_USER_OR_WINDOW; exit 0
+        fi
+        if [ "$(huawei_status)" != 'Row: 0 sound_vibrate=2' ] || [ "$(channel_status)" != EMPTY_UNLOCKED ]; then
+            trace WAIT_ABORTED_CHANNEL; exit 0
+        fi
+        polls=$((polls+1))
+        if [ "$polls" -ge 5 ]; then trace PROCESS_EXIT_TIMEOUT; exit 0; fi
+        trace PROCESS_EXIT_WAIT
+        sleep 1 || { trace PROCESS_WAIT_FAILED; exit 0; }
+    done
+    trace PROCESS_EXITED
+    settings_unused || { trace SETTINGS_CHANGED; exit 0; }
+    prefs_unused || { trace PREFS_CHANGED; exit 0; }
+    [ "$(huawei_status)" = 'Row: 0 sound_vibrate=2' ] || { trace SOUND_BIT_CHANGED; exit 0; }
+    [ "$(channel_status)" = EMPTY_UNLOCKED ] || { trace CHANNEL_CHANGED; exit 0; }
+    window_open || { trace WINDOW_AFTER_KILL; exit 0; }
+    trace GUARDS_RECHECKED
+    [ "$(grep -c '^</map>$' "$prefs" 2>/dev/null)" = 1 ] || { trace XML_END_INVALID; exit 0; }
+    [ "$(grep -c '^<map>$' "$prefs" 2>/dev/null)" = 1 ] || { trace XML_START_INVALID; exit 0; }
+    backup=$(mktemp "$prefs.codex-base.XXXXXX") || { trace BACKUP_TEMP_FAILED; exit 0; }
+    updated=$(mktemp "$prefs.codex-new.XXXXXX") || { trace UPDATE_TEMP_FAILED; rm -f "$backup"; exit 0; }
+    if ! cp -p "$prefs" "$backup" || ! cp -p "$prefs" "$updated"; then
+        trace COPY_FAILED; rm -f "$backup" "$updated"; exit 0
+    fi
+    if ! while IFS= read -r prefline; do
+        if [ "$prefline" = '</map>' ]; then
+            printf '%s\n' '    <boolean name="pref_mms_is_follow_notification_sub0" value="false" />'
+        fi
+        printf '%s\n' "$prefline"
+    done < "$backup" > "$updated"; then trace PREPARE_FAILED; rm -f "$backup" "$updated"; exit 0; fi
+    set -- $(ls -Zd "$prefs" 2>/dev/null); original_label=$1
+    [ -n "$original_label" ] || { trace LABEL_UNAVAILABLE; exit 0; }
+    original_meta=$(stat -c '%u:%g:%a' "$prefs" 2>/dev/null) || original_meta=
+    updated_meta=$(stat -c '%u:%g:%a' "$updated" 2>/dev/null) || updated_meta=
+    set -- $(ls -Zd "$updated" 2>/dev/null); updated_label=$1
+    abort_commit() { trace "$1"; rm -f "$backup" "$updated"; exit 0; }
+    [ -n "$original_meta" ] || abort_commit COMMIT_META_MISSING
+    [ "$original_meta" = "$updated_meta" ] || abort_commit COMMIT_META_MISMATCH
+    [ -n "$original_label" ] || abort_commit COMMIT_LABEL_MISSING
+    [ "$original_label" = "$updated_label" ] || abort_commit COMMIT_LABEL_MISMATCH
+    cmp -s "$prefs" "$backup" || abort_commit COMMIT_PREFS_CHANGED
+    settings_unused || abort_commit COMMIT_SETTINGS_CHANGED
+    window_open || abort_commit COMMIT_WINDOW_EXPIRED
+    mms_safe_to_stop || abort_commit COMMIT_ACTIVITY_CHANGED
+    mms_process_dead || abort_commit COMMIT_PROCESS_RESTARTED
+    [ "$(huawei_status)" = 'Row: 0 sound_vibrate=2' ] || abort_commit COMMIT_SOUND_CHANGED
+    [ "$(channel_status)" = EMPTY_UNLOCKED ] || abort_commit COMMIT_CHANNEL_CHANGED
+    trace READY_TO_COMMIT
+    mv -f "$updated" "$prefs" || { trace COMMIT_FAILED; rm -f "$backup" "$updated"; exit 0; }
+    trace PREF_COMMITTED
+    rm -f "$backup"
+    timeout 5 cmd deviceidle tempwhitelist -u 0 -d 20000 org.codex.smsinit >/dev/null 2>&1 || { trace HELPER_WHITELIST_FAILED; exit 0; }
+    timeout 5 am startservice --user 0 -n org.codex.smsinit/.SmsInitService --es uri "$uri" --es nonce "$nonce" >/dev/null 2>&1 || { trace HELPER_START_FAILED; exit 0; }
+    trace HELPER_START_REQUESTED
+    n=0
+    while [ "$n" -lt 15 ]; do
+        if [ -f "$result" ] && [ ! -L "$result" ]; then
+            IFS= read -r outcome < "$result" || outcome=
+            if [ "$outcome" = "$nonce:OK" ]; then
+                actual=$(timeout 5 settings get system message 2>/dev/null) || actual=
+                cfg=$(huawei_status) || cfg=
+                channel=$(channel_status "$uri") || channel=
+                if [ "$actual" = "$uri" ] && [ "$cfg" = 'Row: 0 sound_vibrate=3' ] && [ "$channel" = MATCH ]; then
+                    (set -C; : > "$success") 2>/dev/null || :; trace SUCCESS_CHECKS_PASSED
+                fi
+                exit 0
+            fi
+            case "$outcome" in "$nonce:"*) trace HELPER_RESULT_NOT_OK; exit 0 ;; esac
+        fi
+        sleep 1 || exit 0
+        n=$((n+1))
+    done
+    trace HELPER_RESULT_TIMEOUT
+    exit 0
+done

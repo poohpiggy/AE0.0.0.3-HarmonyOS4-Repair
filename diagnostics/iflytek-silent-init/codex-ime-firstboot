@@ -1,0 +1,122 @@
+#!/system/bin/sh
+# Explicit clean-import opt-in. This file never removes or resets user data.
+# AE can reset PATH when starting a nested guest shell.
+export PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:$PATH
+root=${CODEX_FS_ROOT:-}
+opt="$root/system/etc/codex/enable-iflytek-ime"
+apk="$root/vendor/etc/codex/iflytek-ime.apk"
+state="$root/data/system/codex-harmony"
+package=com.iflytek.inputmethod
+ime_id=com.iflytek.inputmethod/.FlyIME
+
+[ -f "$opt" ] && [ ! -L "$opt" ] || exit 0
+[ ! -L "$state" ] || exit 0
+mkdir -p "$state" || exit 0
+pending() { [ ! -e "$state/$1" ] && [ ! -L "$state/$1" ]; }
+mark() { (set -C; : > "$state/$1") 2>/dev/null; }
+ensure_mark() { [ -f "$state/$1" ] && [ ! -L "$state/$1" ] || mark "$1"; }
+skip_launch() {
+    [ -f "$state/iflytek-launch-requested" ] && mark iflytek-launch-attempted || :
+}
+
+# Launch only after this script installed the package and it is the selected
+# IME. Record the attempt first: failure, reboot or later user changes must not
+# reopen it. The activity itself owns all consent and onboarding decisions.
+launch_if_ready() {
+    [ -f "$state/iflytek-launch-requested" ] && [ ! -L "$state/iflytek-launch-requested" ] || return 0
+    pending iflytek-launch-attempted || return 0
+    selected=$(settings --user 0 get secure default_input_method 2>/dev/null) || return 0
+    case "$selected" in
+        "$ime_id") ;;
+        ''|null) return 0 ;;
+        *) mark iflytek-launch-attempted || :; return 0 ;;
+    esac
+    methods=$(ime list -a -s 2>/dev/null) || return 0
+    registered=no
+    for method in $methods; do [ "$method" = "$ime_id" ] && registered=yes; done
+    [ "$registered" = yes ] || return 0
+    mark iflytek-launch-attempted || return 0
+    # Explicit silent initialization does not open a first-run activity, even
+    # when the helper is unavailable or refuses an existing user choice.
+    if [ -f "$root/system/etc/codex/enable-iflytek-silent-init" ] && [ ! -L "$root/system/etc/codex/enable-iflytek-silent-init" ]; then
+        if [ -f "$root/system/etc/codex-iflytek-silent-init" ] && [ ! -L "$root/system/etc/codex-iflytek-silent-init" ]; then
+            sh "$root/system/etc/codex-iflytek-silent-init"
+        else
+            printf '%s\n' 'iFlytek silent init helper unavailable; manual setup may be required'
+        fi
+        return 0
+    fi
+    if ! am start --user 0 -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n com.iflytek.inputmethod/.LauncherActivity; then
+        printf '%s\n' 'iFlytek first launch failed; open it manually'
+    fi
+}
+
+android_path=$(pm path android 2>/dev/null) || exit 0
+case "$android_path" in package:*) ;; *) exit 0 ;; esac
+if pending iflytek-installed; then
+    # AE may return success with an empty package list; ask for this package
+    # directly so its preinstalled APK is never needlessly installed again.
+    existing_path=$(pm path "$package" 2>/dev/null) || exit 0
+    case "$existing_path" in package:*) installed=yes ;; *) installed=no ;; esac
+    if [ "$installed" = no ]; then
+        [ -f "$apk" ] && [ ! -L "$apk" ] || exit 0
+        if ! pm install "$apk"; then
+            printf '%s\n' 'iFlytek install failed; will retry when package manager is available'
+            exit 0
+        fi
+        ensure_mark iflytek-launch-requested || exit 0
+    fi
+    installed_path=$(pm path "$package" 2>/dev/null) || exit 0
+    # A fresh ROM may already expose the original APK as a system application.
+    # Request its first-run UI only for this exact bundled path, never an
+    # existing user installation or update under /data/app.
+    if [ "$installed" = yes ] && [ "$installed_path" = 'package:/vendor/app/iFlytekIME/iFlytekIME.apk' ]; then
+        ensure_mark iflytek-launch-requested || exit 0
+    fi
+    case "$installed_path" in package:*) mark iflytek-installed || exit 0 ;; *) exit 0 ;; esac
+fi
+
+# A later user uninstall must not be reversed or followed by a default change.
+installed_path=$(pm path "$package" 2>/dev/null) || exit 0
+case "$installed_path" in package:*) ;; *) exit 0 ;; esac
+if ! pending iflytek-default-attempted; then launch_if_ready; exit 0; fi
+current=$(settings --user 0 get secure default_input_method 2>/dev/null) || exit 0
+case "$current" in
+    "$ime_id") mark iflytek-default-attempted || :; launch_if_ready; exit 0 ;;
+    ''|null|com.baidu.input_huawei/*) ;;
+    *) mark iflytek-default-attempted || :; launch_if_ready; exit 0 ;;
+esac
+
+# PackageManager success is not enough: IME service must be registered first.
+methods=$(ime list -a -s 2>/dev/null) || exit 0
+registered=no
+for method in $methods; do [ "$method" = "$ime_id" ] && registered=yes; done
+[ "$registered" = yes ] || exit 0
+
+# Take the attempt once only. On failure, report for deliberate review rather
+# than later overwriting a user change. Recheck immediately before setting.
+mark iflytek-default-attempted || exit 0
+if ! ime enable --user 0 "$ime_id"; then
+    skip_launch
+    printf '%s\n' 'iFlytek enable failed; manual review required'
+    exit 0
+fi
+current=$(settings --user 0 get secure default_input_method 2>/dev/null) || { skip_launch; exit 0; }
+case "$current" in
+    ''|null|com.baidu.input_huawei/*) ;;
+    "$ime_id") mark iflytek-default-selected || :; launch_if_ready; exit 0 ;;
+    *) skip_launch; exit 0 ;;
+esac
+if ime set --user 0 "$ime_id"; then
+    actual=$(settings --user 0 get secure default_input_method 2>/dev/null) || actual=
+    if [ "$actual" = "$ime_id" ]; then
+        mark iflytek-default-selected || :
+        launch_if_ready
+    else
+        skip_launch
+        printf '%s\n' 'iFlytek selection not confirmed; manual review required'
+    fi
+else
+    skip_launch
+    printf '%s\n' 'iFlytek selection failed; manual review required'
+fi

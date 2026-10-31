@@ -1,0 +1,29 @@
+#!/system/bin/sh
+# Explicit opt-in, once per fresh ROM data. Never overwrite later user choices.
+export PATH=/system/bin:/system/xbin:$PATH
+root=${CODEX_FS_ROOT:-}
+opt="$root/system/etc/codex/enable-zh-locale"
+jar="$root/system/etc/codex/codex-locale.jar"
+state="$root/data/system/codex-harmony"
+[ -f "$opt" ] && [ ! -L "$opt" ] && [ -f "$jar" ] && [ ! -L "$jar" ] || exit 0
+[ ! -L "$state" ] && mkdir -p "$state" || exit 0
+[ ! -e "$state/locale-attempted" ] && [ ! -L "$state/locale-attempted" ] || exit 0
+current=$(settings --user 0 get system system_locales 2>/dev/null) || exit 0
+# Set a fresh default only. Preserve any pre-existing non-default choice.
+case "$current" in
+  ''|null|en-US) ;;
+  *) (set -C; : > "$state/locale-attempted") 2>/dev/null || :; exit 0 ;;
+esac
+(set -C; : > "$state/locale-attempted") 2>/dev/null || exit 0
+# The Java side checks the active configuration a second time immediately
+# before writing. On failure the user can select a language manually.
+if CLASSPATH="$jar" app_process /system/bin org.codex.locale.Bootstrap; then
+  actual=$(settings --user 0 get system system_locales 2>/dev/null) || actual=
+  if [ "$actual" = zh-CN ]; then
+    (set -C; : > "$state/locale-initialized") 2>/dev/null || :
+  else
+    printf '%s\n' 'Chinese default not confirmed; select a language manually'
+  fi
+else
+  printf '%s\n' 'Chinese default setup failed; select a language manually'
+fi

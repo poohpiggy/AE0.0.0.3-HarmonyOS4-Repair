@@ -1,0 +1,19 @@
+#!/system/bin/sh
+# Optional fresh-ROM setup. This cannot grant permissions or touch other apps.
+export PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:$PATH
+root=${CODEX_FS_ROOT:-}
+opt="$root/system/etc/codex/enable-via-location-default"
+jar="$root/system/etc/codex/codex-via-location-default.jar"
+state="$root/data/system/codex-harmony"
+[ -f "$opt" ] && [ ! -L "$opt" ] && [ -f "$jar" ] && [ ! -L "$jar" ] || exit 0
+[ ! -L "$state" ] && mkdir -p "$state" || exit 0
+[ ! -e "$state/via-location-default-reviewed" ] && [ ! -L "$state/via-location-default-reviewed" ] || exit 0
+android_path=$(pm path android 2>/dev/null) || exit 0
+case "$android_path" in package:*) ;; *) exit 0 ;; esac
+via_path=$(pm path mark.via 2>/dev/null) || exit 0
+[ "$via_path" = 'package:/vendor/app/ViaBrowser/ViaBrowser.apk' ] || exit 0
+if CLASSPATH="$jar" app_process /system/bin org.codex.privacy.ViaLocationDefault; then
+    (set -C; : > "$state/via-location-default-reviewed") 2>/dev/null || :
+else
+    printf '%s\n' 'Via default location permission not ready or not changed; will retry'
+fi

@@ -1,0 +1,25 @@
+#!/system/bin/sh
+# Optional fresh-ROM setup. Never block unrelated or updated user applications.
+export PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:$PATH
+root=${CODEX_FS_ROOT:-}
+opt="$root/system/etc/codex/enable-uninstall-protection"
+jar="$root/system/etc/codex/codex-protect-preinstalled.jar"
+state="$root/data/system/codex-harmony"
+[ -f "$opt" ] && [ ! -L "$opt" ] && [ -f "$jar" ] && [ ! -L "$jar" ] || exit 0
+[ ! -L "$state" ] && mkdir -p "$state" || exit 0
+android_path=$(pm path android 2>/dev/null) || exit 0
+case "$android_path" in package:*) ;; *) exit 0 ;; esac
+
+protect() {
+    package=$1 expected=$2 marker=$3
+    [ ! -e "$state/$marker" ] && [ ! -L "$state/$marker" ] || return 0
+    installed_path=$(pm path "$package" 2>/dev/null) || return 0
+    [ "$installed_path" = "package:$expected" ] || return 0
+    if CLASSPATH="$jar" app_process /system/bin org.codex.protect.BlockUninstall "$package"; then
+        (set -C; : > "$state/$marker") 2>/dev/null || :
+    else
+        printf '%s\n' "Uninstall protection failed for $package; will retry"
+    fi
+}
+protect com.iflytek.inputmethod /vendor/app/iFlytekIME/iFlytekIME.apk uninstall-protected-iflytek
+protect mark.via /vendor/app/ViaBrowser/ViaBrowser.apk uninstall-protected-via

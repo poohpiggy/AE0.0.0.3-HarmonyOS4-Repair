@@ -1,0 +1,4 @@
+service codex-radio-hal-1 /vendor/bin/hw/codex-ae-rild -l /vendor/lib64/libcodex-ae-ril.so
+    class main
+    user radio
+    group radio cache inet misc audio log readproc wakelock

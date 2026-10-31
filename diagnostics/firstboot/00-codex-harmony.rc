@@ -1,0 +1,11 @@
+# AE 0.0.0.3 imports exports from init rc when analysing a new ROM.
+# This is consumed during import; it does not update an existing image.json.
+on early-init
+    export CUST_POLICY_DIRS /system/emui:/system/global:/system/etc:/oem:/data/cust:/cust_spec:/system/emui/china
+
+service codex_harmony_boot /system/bin/codex-harmony-sh /system/etc/codex-harmony-start
+    class core
+    user root
+
+service codex_distributeddata /system/bin/sa_main /system/profile/distributeddata.xml
+    user root

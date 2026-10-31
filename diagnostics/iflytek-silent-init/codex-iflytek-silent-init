@@ -1,0 +1,73 @@
+#!/system/bin/sh
+# One-time, explicitly authorized silent first-run candidate; never launch UI.
+export PATH=/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:$PATH
+root=${CODEX_FS_ROOT:-}
+opt="$root/system/etc/codex/enable-iflytek-silent-init"
+jar="$root/system/etc/codex/codex-iflytek-silent-init.jar"
+state="$root/data/system/codex-harmony"
+app="$root/data/user/0/com.iflytek.inputmethod"
+prefs="$app/shared_prefs"
+apk="$root/vendor/app/iFlytekIME/iFlytekIME.apk"
+privacy="$prefs/com.iflytek.inputmethod_assistsettings.xml"
+layout="$prefs/com.iflytek.inputmethod_inner_preferences.xml"
+style="$prefs/com.iflytek.inputmethod_preferences.xml"
+[ -f "$opt" ] && [ ! -L "$opt" ] && [ -f "$jar" ] && [ ! -L "$jar" ] || exit 0
+[ -d "$state" ] && [ ! -L "$state" ] && [ -d "$app" ] && [ ! -L "$app" ] || exit 0
+[ -f "$apk" ] && [ ! -L "$apk" ] || exit 0
+[ "$(pm path com.iflytek.inputmethod 2>/dev/null)" = 'package:/vendor/app/iFlytekIME/iFlytekIME.apk' ] || exit 0
+[ "$(settings --user 0 get secure default_input_method 2>/dev/null)" = 'com.iflytek.inputmethod/.FlyIME' ] || exit 0
+hash=$(sha256sum "$apk" 2>/dev/null) || exit 0
+[ "${hash%% *}" = 45af337a72d89b56bd788849bba61a6667375210feb4b73f6e18d96811760ac7 ] || exit 0
+[ ! -L "$prefs" ] && [ ! -L "$privacy" ] && [ ! -L "$layout" ] && [ ! -L "$style" ] || exit 0
+[ ! -e "$privacy.bak" ] && [ ! -L "$privacy.bak" ] && [ ! -e "$layout.bak" ] && [ ! -L "$layout.bak" ] && [ ! -e "$style.bak" ] && [ ! -L "$style.bak" ] || exit 0
+marker="$state/iflytek-silent-init-attempted"
+[ ! -e "$marker" ] && [ ! -L "$marker" ] || exit 0
+(set -C; : > "$marker") 2>/dev/null || exit 0
+am force-stop com.iflytek.inputmethod >/dev/null 2>&1 || exit 0
+# AE normally inherits the correct label and may deny even a redundant chcon.
+# Only attempt relabeling when needed, then require an exact read-back match.
+ensure_label() {
+    expected=$1; target=$2
+    actual=$(stat -c '%C' "$target") || return 1
+    if [ "$actual" != "$expected" ]; then
+        chcon "$expected" "$target" || return 1
+        actual=$(stat -c '%C' "$target") || return 1
+    fi
+    [ "$actual" = "$expected" ]
+}
+# If the package has not created preferences yet, use its app UID and label.
+if [ ! -d "$prefs" ]; then
+    owner=$(stat -c '%u:%g' "$app") || exit 0
+    label=$(stat -c '%C' "$app") || exit 0
+    case "$owner" in *[!0-9:]*|:*) exit 0 ;; esac
+    case "$label" in u:object_r:app_data_file:s0:*) ;; *) exit 0 ;; esac
+    mkdir "$prefs" || exit 0
+    chown "$owner" "$prefs" && chmod 771 "$prefs" && ensure_label "$label" "$prefs" || exit 0
+    [ "$(stat -c '%u:%g' "$prefs")" = "$owner" ] || exit 0
+fi
+[ -d "$prefs" ] && [ ! -L "$prefs" ] || exit 0
+p=$(mktemp "$prefs/.codex-privacy.XXXXXX") || exit 0
+l=$(mktemp "$prefs/.codex-layout.XXXXXX") || { rm -f "$p"; exit 0; }
+v=$(mktemp "$prefs/.codex-style.XXXXXX") || { rm -f "$p" "$l"; exit 0; }
+trap 'rm -f "$p" "$l" "$v"' EXIT HUP INT TERM
+CLASSPATH="$jar" app_process /system/bin SilentInit "$privacy" "$layout" "$style" "$p" "$l" "$v" || exit 0
+# Existing prefs keep their own owner, mode and SELinux category; new ones use
+# the package directory owner/category. Never copy data from another instance.
+set_meta() {
+    source=$1; dest=$2
+    if [ -e "$source" ]; then ref=$source; mode=$(stat -c '%a' "$ref") || return 1
+    else ref=$app; mode=600; fi
+    owner=$(stat -c '%u:%g' "$ref") || return 1
+    label=$(stat -c '%C' "$ref") || return 1
+    case "$owner" in *[!0-9:]*|:*) return 1 ;; esac
+    case "$mode" in ''|*[!0-7]*) return 1 ;; esac
+    case "$label" in u:object_r:app_data_file:s0:*) ;; *) return 1 ;; esac
+    chown "$owner" "$dest" && chmod "$mode" "$dest" && ensure_label "$label" "$dest" || return 1
+    [ "$(stat -c '%u:%g' "$dest")" = "$owner" ]
+}
+set_meta "$privacy" "$p" && set_meta "$layout" "$l" && set_meta "$style" "$v" || exit 0
+# Publish layout before privacy: a partial failure cannot silently grant consent.
+mv "$l" "$layout" || exit 0
+mv "$v" "$style" || exit 0
+mv "$p" "$privacy" || exit 0
+(set -C; : > "$state/iflytek-silent-init-written") 2>/dev/null || :
